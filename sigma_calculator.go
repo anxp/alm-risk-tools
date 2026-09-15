@@ -75,15 +75,32 @@ func loadTickHistory(path string) ([]TickPoint, error) {
 	return points, nil
 }
 
-// normalizeTickHistory - prepare input data - sort, remove duplicates, remove too short intervals.
+// NormalizedTickHistory -- дані, які вже пройшли через NormalizeTickHistory:
+// відсортовані, дедубльовані, очищені від підозріло коротких інтервалів.
+// ComputeSigmaRealizedVariance приймає САМЕ цей тип -- тому сирий, необроблений
+// []TickPoint туди просто НЕ ВІЙДЕ без явного перетворення типу, яке одразу
+// впаде в очі на code review.
+type NormalizedTickHistory []TickPoint
+
+// NormalizationStats -- усе, що встановлюється РІВНО ОДИН РАЗ на етапі нормалізації:
+// медіана інтервалу і похідні від неї пороги. Рахується один раз на весь датасет
+// і потім передається явно в кожен виклик ComputeSigmaRealizedVariance, щоб усі
+// під-вікна використовували ОДНАКОВЕ означення "короткого інтервалу" й "розриву".
+type NormalizationStats struct {
+	IntervalMedianValue       int64
+	GapThresholdSec           int64
+	ShortIntervalThresholdSec int64
+	RemovedDuplicates         int64
+	RemovedShortIntervals     int64
+}
+
+// NormalizeTickHistory - prepare input data - sort, remove duplicates, remove too short intervals.
 //
-//	points - input (raw) data set
-//
-//	filteredData - sorted data set, filtered from duplicates and short intervals.
-//	removedDuplicates - number of removed duplicates.
-//	removedShortIntervals - number of removed short intervals.
-func normalizeTickHistory(rawPoints []TickPoint) (filteredData []TickPoint, intervalMedianValue int64, intervalFilteringLowerThreshold int64, removedDuplicates int64, removedShortIntervals int64) {
-	const ShortIntervalThresholdFactor = 10
+//	rawPoints - input (raw) data set
+//	NormalizedTickHistory - sorted data set, filtered from duplicates and short intervals.
+//	NormalizationStats - statistic data that should be calculated only once - median value of interval etc.
+func NormalizeTickHistory(rawPoints []TickPoint) (NormalizedTickHistory, NormalizationStats) {
+	const ThresholdFactor = 10 // симетричний фактор: medianDelta/10 -- "занадто коротко", medianDelta*10 -- "розрив"
 
 	sort.Slice(rawPoints, func(i, j int) bool {
 		return rawPoints[i].Timestamp < rawPoints[j].Timestamp
@@ -94,31 +111,40 @@ func normalizeTickHistory(rawPoints []TickPoint) (filteredData []TickPoint, inte
 		deltaT[i-1] = rawPoints[i].Timestamp - rawPoints[i-1].Timestamp
 	}
 
-	intervalMedianValue = array_basics.FindMedian[int64](deltaT)
-	skipIntervalsLessThanXSec := intervalMedianValue / ShortIntervalThresholdFactor // Skip too short intervals.
+	medianDelta := array_basics.FindMedian[int64](deltaT)
+	shortThreshold := medianDelta / ThresholdFactor
+	gapThreshold := medianDelta * ThresholdFactor
 
-	filteredData = make([]TickPoint, 0, len(rawPoints))
+	filteredData := make([]TickPoint, 0, len(rawPoints))
+	var removedDuplicates, removedShortIntervals int64
 
 	for _, rawPoint := range rawPoints {
 		l := len(filteredData)
-		duplicateFound := l > 0 && (filteredData[l-1].Timestamp == rawPoint.Timestamp)
-		shortIntervalFound := l > 0 && skipIntervalsLessThanXSec > 0 && rawPoint.Timestamp-filteredData[l-1].Timestamp < skipIntervalsLessThanXSec
+		duplicateFound := l > 0 && filteredData[l-1].Timestamp == rawPoint.Timestamp
+		shortIntervalFound := l > 0 && shortThreshold > 0 && rawPoint.Timestamp-filteredData[l-1].Timestamp < shortThreshold
 
-		if duplicateFound {
+		switch {
+		case duplicateFound:
 			removedDuplicates++
-			filteredData[len(filteredData)-1] = rawPoint
-		} else if shortIntervalFound {
+			filteredData[l-1] = rawPoint
+		case shortIntervalFound:
 			removedShortIntervals++
 			// Here, we do not handle situations where significant changes are recorded over
 			// a SHORT time interval - we simply take the latest reading. This is acceptable,
 			// as the price measurement accuracy on a STANDARD (NORMAL) time intervals is not better.
-			filteredData[len(filteredData)-1] = rawPoint
-		} else {
+			filteredData[l-1] = rawPoint
+		default:
 			filteredData = append(filteredData, rawPoint)
 		}
 	}
 
-	return filteredData, intervalMedianValue, skipIntervalsLessThanXSec, removedDuplicates, removedShortIntervals
+	return filteredData, NormalizationStats{
+		IntervalMedianValue:       medianDelta,
+		GapThresholdSec:           gapThreshold,
+		ShortIntervalThresholdSec: shortThreshold,
+		RemovedDuplicates:         removedDuplicates,
+		RemovedShortIntervals:     removedShortIntervals,
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -142,69 +168,53 @@ func convertTickToLnOfPrice(tick int64) float64 {
 
 // RealizedVariance - проміжні числа розрахунку, щоб бачити хід обчислення.
 type RealizedVariance struct {
-	SigmaDaily            float64
-	DaysUsedNet           float64
-	IntervalMedianValue   int64
-	IntervalsUsed         int64
-	GapsSkipped           int64
-	GapThresholdSec       int64 // Every time frame, larger than this threshold considered as GAP and not taken into calculation.
-	LowerThresholdSec     int64 // Every interval shorter than LowerThresholdSec considered as "noise" (maybe data from repeated request?) and skipped.
-	RemovedDuplicates     int64
-	RemovedShortIntervals int64
-	FilteredPoints        []TickPoint
+	SigmaDaily      float64
+	DaysUsedNet     float64
+	IntervalsUsed   int64
+	GapsSkipped     int64
+	GapThresholdSec int64 // Every time frame, larger than this threshold considered as GAP and not taken into calculation.
 }
 
-func computeSigmaRealizedVariance(points []TickPoint) (RealizedVariance, error) {
-	const GapThresholdMultiplier = 10
-
-	filteredData, intervalMedianValue, intervalFilteringLowerThreshold, removedDuplicates, removedShortIntervals := normalizeTickHistory(points)
-
-	if len(filteredData) < 2 {
-		return RealizedVariance{}, fmt.Errorf("too few filtered data for calculations")
+// ComputeSigmaRealizedVariance вимагає ВЖЕ нормалізовані дані (див. NormalizeTickHistory)
+// і явний поріг розриву -- саме тому один і той самий поріг можна свідомо
+// перевикористати для кількох під-вікон одного датасету, забезпечуючи чесне порівняння.
+func ComputeSigmaRealizedVariance(points NormalizedTickHistory, gapThresholdSec int64) (RealizedVariance, error) {
+	if len(points) < 2 {
+		return RealizedVariance{}, fmt.Errorf("too few normalized data points for calculation")
 	}
 
-	gapThresholdSec := GapThresholdMultiplier * intervalMedianValue
-	gapsSkipped := int64(0)
-	rXrNormalizedByDaySum := float64(0)
-	daysUsedNet := float64(0)
-	intervalsUsed := int64(0)
-	sigmaDaily := float64(0)
+	var gapsSkipped, intervalsUsed int64
+	var rXrNormalizedByDaySum, daysUsedNet float64
 
-	for i := 1; i < len(filteredData); i++ {
-		dtSec := filteredData[i].Timestamp - filteredData[i-1].Timestamp
+	for i := 1; i < len(points); i++ {
+		dtSec := points[i].Timestamp - points[i-1].Timestamp
 		if dtSec <= 0 {
 			continue
 		}
 		if dtSec > gapThresholdSec {
 			gapsSkipped++
-			continue // великий розрив -- виключаємо цей інтервал з розрахунку
+			continue
 		}
 
-		// Δt expressed (recalculated) in days
 		dtDays := float64(dtSec) / 86400.0
-		r := convertTickToLnOfPrice(filteredData[i].Tick) - convertTickToLnOfPrice(filteredData[i-1].Tick)
+		r := convertTickToLnOfPrice(points[i].Tick) - convertTickToLnOfPrice(points[i-1].Tick)
 		rXrNormalizedByDaySum += (r * r) / dtDays
 
 		daysUsedNet += dtDays
 		intervalsUsed++
 	}
 
+	var sigmaDaily float64
 	if daysUsedNet > 0 {
-		// σ = sqrt(Σ[r_i²/(N * Δt_i)])
 		sigmaDaily = math.Sqrt(rXrNormalizedByDaySum / float64(intervalsUsed))
 	}
 
 	return RealizedVariance{
-		SigmaDaily:            sigmaDaily,
-		DaysUsedNet:           daysUsedNet,
-		IntervalMedianValue:   intervalMedianValue,
-		IntervalsUsed:         intervalsUsed,
-		GapsSkipped:           gapsSkipped,
-		GapThresholdSec:       gapThresholdSec,
-		LowerThresholdSec:     intervalFilteringLowerThreshold,
-		RemovedDuplicates:     removedDuplicates,
-		RemovedShortIntervals: removedShortIntervals,
-		FilteredPoints:        filteredData,
+		SigmaDaily:      sigmaDaily,
+		DaysUsedNet:     daysUsedNet,
+		IntervalsUsed:   intervalsUsed,
+		GapsSkipped:     gapsSkipped,
+		GapThresholdSec: gapThresholdSec,
 	}, nil
 }
 
@@ -215,7 +225,7 @@ func computeSigmaRealizedVariance(points []TickPoint) (RealizedVariance, error) 
 // resampleHourlyLastValue групує точки по годинних "бакетах" (timestamp/3600),
 // в кожному бакеті лишає ОСТАННІЙ записаний тік, і розбиває на сегменти там,
 // де пропущено більше однієї сусідньої години (тобто теж виключає розриви).
-func resampleHourlyLastValue(points []TickPoint) [][]float64 {
+func resampleHourlyLastValue(points NormalizedTickHistory) [][]float64 {
 	buckets := make(map[int64]int64)
 	for _, p := range points {
 		bucket := p.Timestamp / 3600
@@ -251,7 +261,7 @@ func resampleHourlyLastValue(points []TickPoint) [][]float64 {
 	return segments
 }
 
-func computeSigmaHourlyResample(points []TickPoint) (sigmaDaily float64, nReturns int) {
+func computeSigmaHourlyResample(points NormalizedTickHistory) (sigmaDaily float64, nReturns int) {
 	segments := resampleHourlyLastValue(points)
 
 	var returns []float64
@@ -287,30 +297,16 @@ func computeSigmaHourlyResample(points []TickPoint) (sigmaDaily float64, nReturn
 // КРОК 5: перевірка стабільності sigma в часі (rolling-вікна)
 // ---------------------------------------------------------------------------
 
-func computeSigmaForWindow(points []TickPoint, windowDays int) (RealizedVariance, bool) {
+// FilterWindow повертає підмножину вже нормалізованих даних за останні windowDays днів.
+// Дані вже відсортовані й очищені -- тому результат теж НЕ потребує повторної
+// нормалізації (жодного повторного сортування/дедублікації/пошуку медіани).
+func (points NormalizedTickHistory) FilterWindow(windowDays int) NormalizedTickHistory {
 	if len(points) == 0 {
-		return RealizedVariance{}, false
+		return nil
 	}
-
-	lastTs := points[len(points)-1].Timestamp
-	cutoff := lastTs - int64(windowDays)*86400
-
-	var sub []TickPoint
-	for _, p := range points {
-		if p.Timestamp >= cutoff {
-			sub = append(sub, p)
-		}
-	}
-	if len(sub) < 2 {
-		return RealizedVariance{}, false
-	}
-
-	rv, err := computeSigmaRealizedVariance(sub)
-	if err != nil {
-		return RealizedVariance{}, false
-	}
-
-	return rv, true
+	cutoff := points[len(points)-1].Timestamp - int64(windowDays)*86400
+	idx := sort.Search(len(points), func(i int) bool { return points[i].Timestamp >= cutoff })
+	return points[idx:]
 }
 
 // ---------------------------------------------------------------------------
@@ -335,29 +331,30 @@ func main() {
 
 	fmt.Printf("Завантажено рядків (до чистки): %d\n", len(raw))
 
-	rv, err := computeSigmaRealizedVariance(raw)
+	normalized, stats := NormalizeTickHistory(raw) // ← нормалізація й пороги -- РІВНО ОДИН РАЗ
+	rv, err := ComputeSigmaRealizedVariance(normalized, stats.GapThresholdSec)
+
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Помилка: %v\n", err)
 		os.Exit(1)
 	}
 
-	spanDays := float64(rv.FilteredPoints[len(rv.FilteredPoints)-1].Timestamp-rv.FilteredPoints[0].Timestamp) / 86400.0
-	fmt.Printf("Період даних: %.1f днів (timestamp from %d to %d)\n\n", spanDays, rv.FilteredPoints[0].Timestamp, rv.FilteredPoints[len(rv.FilteredPoints)-1].Timestamp)
-	fmt.Printf("Після сортування і дедуплікації за timestamp: %d\n", len(rv.FilteredPoints))
-	fmt.Printf("Видалено дублікатів: %d\n", rv.RemovedDuplicates)
-	fmt.Printf("Видалено коротких інтервалів (менше за %d сек): %d\n\n", rv.LowerThresholdSec, rv.RemovedShortIntervals)
+	spanDays := float64(normalized[len(normalized)-1].Timestamp-normalized[0].Timestamp) / 86400.0
+	fmt.Printf("Період даних: %.1f днів (timestamp from %d to %d)\n\n", spanDays, normalized[0].Timestamp, normalized[len(normalized)-1].Timestamp)
+	fmt.Printf("Після сортування і дедуплікації за timestamp: %d\n", len(normalized))
+	fmt.Printf("Видалено дублікатів: %d\n", stats.RemovedDuplicates)
+	fmt.Printf("Видалено коротких інтервалів (менше за %d сек): %d\n\n", stats.ShortIntervalThresholdSec, stats.RemovedShortIntervals)
 
 	fmt.Printf("=== КРОК 2-3: реалізована варіація -> sigma_daily ===\n")
 	fmt.Printf("Інтервалів використано: %d\n", rv.IntervalsUsed)
-	fmt.Printf("Медіанне значення інтервалу: %d сек\n", rv.IntervalMedianValue)
+	fmt.Printf("Медіанне значення інтервалу: %d сек\n", stats.IntervalMedianValue)
 	fmt.Printf("Розривів (> %d сек) виключено: %d\n", rv.GapThresholdSec, rv.GapsSkipped)
 	fmt.Printf("Сумарний 'чистий' час: %.2f днів\n", rv.DaysUsedNet)
 	fmt.Printf("sigma_daily (метод A) = sqrt(Σ[r_i²/(N * Δt_i)]) = %.4f\n\n", rv.SigmaDaily)
 
 	fmt.Printf("=== КРОК 4: крос-перевірка (годинний ресемплінг + stdev) ===\n")
 
-	points := rv.FilteredPoints
-	sigmaB, nReturns := computeSigmaHourlyResample(points)
+	sigmaB, nReturns := computeSigmaHourlyResample(normalized)
 	fmt.Printf("Годинних приростів використано: %d\n", nReturns)
 	fmt.Printf("sigma_daily (метод B) = sigma_hourly * sqrt(24) = %.4f\n", sigmaB)
 
@@ -378,10 +375,17 @@ func main() {
 		if w <= 0 || seen[w] {
 			continue
 		}
+
 		seen[w] = true
-		rvW, ok := computeSigmaForWindow(points, w)
-		if !ok {
+
+		sub := normalized.FilterWindow(w) // ← лише фільтр за часом, без повторної обробки
+		if len(sub) < 2 {
 			continue
+		}
+		rvW, err := ComputeSigmaRealizedVariance(sub, stats.GapThresholdSec) // ← той самий поріг всюди
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Помилка: %v\n", err)
+			os.Exit(1)
 		}
 		fmt.Printf("%9d днів %12.4f  (даних використано: %.1f днів)\n", w, rvW.SigmaDaily, rvW.DaysUsedNet)
 	}
