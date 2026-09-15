@@ -89,9 +89,9 @@ func normalizeTickHistory(rawPoints []TickPoint) (filteredData []TickPoint, inte
 		return rawPoints[i].Timestamp < rawPoints[j].Timestamp
 	})
 
-	deltaT := make([]int64, len(rawPoints)-1, len(rawPoints)-1)
-	for i := 1; i < len(rawPoints)-1; i++ {
-		deltaT[i] = rawPoints[i].Timestamp - rawPoints[i-1].Timestamp
+	deltaT := make([]int64, len(rawPoints)-1)
+	for i := 1; i < len(rawPoints); i++ {
+		deltaT[i-1] = rawPoints[i].Timestamp - rawPoints[i-1].Timestamp
 	}
 
 	intervalMedianValue = array_basics.FindMedian[int64](deltaT)
@@ -151,7 +151,7 @@ type RealizedVariance struct {
 	LowerThresholdSec     int64 // Every interval shorter than LowerThresholdSec considered as "noise" (maybe data from repeated request?) and skipped.
 	RemovedDuplicates     int64
 	RemovedShortIntervals int64
-	FilteredPoints        *[]TickPoint
+	FilteredPoints        []TickPoint
 }
 
 func computeSigmaRealizedVariance(points []TickPoint) (RealizedVariance, error) {
@@ -204,7 +204,7 @@ func computeSigmaRealizedVariance(points []TickPoint) (RealizedVariance, error) 
 		LowerThresholdSec:     intervalFilteringLowerThreshold,
 		RemovedDuplicates:     removedDuplicates,
 		RemovedShortIntervals: removedShortIntervals,
-		FilteredPoints:        &filteredData,
+		FilteredPoints:        filteredData,
 	}, nil
 }
 
@@ -334,15 +334,16 @@ func main() {
 	}
 
 	fmt.Printf("Завантажено рядків (до чистки): %d\n", len(raw))
-	spanDays := float64(raw[len(raw)-1].Timestamp-raw[0].Timestamp) / 86400.0
-	fmt.Printf("Період даних: %.1f днів (timestamp from %d to %d)\n\n", spanDays, raw[0].Timestamp, raw[len(raw)-1].Timestamp)
 
 	rv, err := computeSigmaRealizedVariance(raw)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Помилка: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Після сортування і дедуплікації за timestamp: %d\n", len(*rv.FilteredPoints))
+
+	spanDays := float64(rv.FilteredPoints[len(rv.FilteredPoints)-1].Timestamp-rv.FilteredPoints[0].Timestamp) / 86400.0
+	fmt.Printf("Період даних: %.1f днів (timestamp from %d to %d)\n\n", spanDays, rv.FilteredPoints[0].Timestamp, rv.FilteredPoints[len(rv.FilteredPoints)-1].Timestamp)
+	fmt.Printf("Після сортування і дедуплікації за timestamp: %d\n", len(rv.FilteredPoints))
 	fmt.Printf("Видалено дублікатів: %d\n", rv.RemovedDuplicates)
 	fmt.Printf("Видалено коротких інтервалів (менше за %d сек): %d\n\n", rv.LowerThresholdSec, rv.RemovedShortIntervals)
 
@@ -355,7 +356,7 @@ func main() {
 
 	fmt.Printf("=== КРОК 4: крос-перевірка (годинний ресемплінг + stdev) ===\n")
 
-	points := *rv.FilteredPoints // A COPY of value
+	points := rv.FilteredPoints
 	sigmaB, nReturns := computeSigmaHourlyResample(points)
 	fmt.Printf("Годинних приростів використано: %d\n", nReturns)
 	fmt.Printf("sigma_daily (метод B) = sigma_hourly * sqrt(24) = %.4f\n", sigmaB)
