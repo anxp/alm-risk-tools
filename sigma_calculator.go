@@ -121,27 +121,6 @@ func normalizeTickHistory(rawPoints []TickPoint) (filteredData []TickPoint, inte
 	return filteredData, intervalMedianValue, skipIntervalsLessThanXSec, removedDuplicates, removedShortIntervals
 }
 
-// autodetectGapThreshold automatically detects GAP(s) and returns min-gap-threshold.
-//
-//	NOTE: input data should be SORTED and CLEANED!
-func autodetectGapThreshold(points []TickPoint) int64 {
-	const Multiplier = 10
-
-	timeDeltas := make([]int64, 0, len(points)-1)
-
-	for i := 1; i < len(points); i++ {
-		if points[i].Timestamp <= points[i-1].Timestamp {
-			panic("Input data should be SORTED and CLEANED!")
-		}
-
-		timeDeltas = append(timeDeltas, points[i].Timestamp-points[i-1].Timestamp)
-	}
-
-	medianDelta := array_basics.FindMedian[int64](timeDeltas)
-
-	return Multiplier * medianDelta
-}
-
 // ---------------------------------------------------------------------------
 // КРОК 1: тік -> логарифм ціни
 // ---------------------------------------------------------------------------
